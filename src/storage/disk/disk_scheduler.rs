@@ -12,9 +12,11 @@ use super::DiskManager;
 pub struct DiskRequest {
     /// Whether this is a write (true) or read (false) request
     pub is_write: bool,
-    /// The page ID to read/write
+    /// The starting page ID to read/write
     pub page_id: PageId,
-    /// Pointer to the data buffer (must be PAGE_SIZE bytes)
+    /// Number of pages to read/write (1 for single page, >1 for sequential I/O)
+    pub num_pages: u32,
+    /// Pointer to the data buffer (must be PAGE_SIZE * num_pages bytes)
     /// For reads: data will be written here
     /// For writes: data will be read from here
     pub data: *mut u8,
@@ -27,21 +29,47 @@ pub struct DiskRequest {
 unsafe impl Send for DiskRequest {}
 
 impl DiskRequest {
-    /// Creates a new read request
+    /// Creates a new single-page read request
     pub fn read(page_id: PageId, data: *mut u8) -> Self {
         Self {
             is_write: false,
             page_id,
+            num_pages: 1,
             data,
             callback: None,
         }
     }
 
-    /// Creates a new write request
+    /// Creates a new single-page write request
     pub fn write(page_id: PageId, data: *mut u8) -> Self {
         Self {
             is_write: true,
             page_id,
+            num_pages: 1,
+            data,
+            callback: None,
+        }
+    }
+
+    /// Creates a new sequential multi-page read request
+    /// Reads num_pages starting from page_id in a single I/O operation
+    pub fn read_sequential(page_id: PageId, num_pages: u32, data: *mut u8) -> Self {
+        Self {
+            is_write: false,
+            page_id,
+            num_pages,
+            data,
+            callback: None,
+        }
+    }
+
+    /// Creates a new sequential multi-page write request
+    /// Writes num_pages starting from page_id in a single I/O operation
+    pub fn write_sequential(page_id: PageId, num_pages: u32, data: *mut u8) -> Self {
+        Self {
+            is_write: true,
+            page_id,
+            num_pages,
             data,
             callback: None,
         }
@@ -130,6 +158,57 @@ impl DiskScheduler {
         Ok(())
     }
 
+    /// Schedules a sequential multi-page read request and waits for completion.
+    /// Reads num_pages starting from start_page_id in a SINGLE I/O operation.
+    /// This is much faster than calling schedule_read_sync() multiple times.
+    pub fn schedule_read_pages_sync(
+        &self,
+        start_page_id: PageId,
+        num_pages: u32,
+        data: &mut [u8],
+    ) -> Result<()> {
+        let expected_size = (num_pages as usize) * PAGE_SIZE;
+        assert_eq!(data.len(), expected_size);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let request = DiskRequest::read_sequential(start_page_id, num_pages, data.as_mut_ptr())
+            .with_callback(tx);
+
+        self.schedule(request)?;
+
+        rx.recv().map_err(|e| {
+            CrioError::DiskScheduler(format!("Failed to receive completion: {}", e))
+        })?;
+
+        Ok(())
+    }
+
+    /// Schedules a sequential multi-page write request and waits for completion.
+    /// Writes num_pages starting from start_page_id in a SINGLE I/O operation.
+    /// This is much faster than calling schedule_write_sync() multiple times.
+    pub fn schedule_write_pages_sync(
+        &self,
+        start_page_id: PageId,
+        num_pages: u32,
+        data: &[u8],
+    ) -> Result<()> {
+        let expected_size = (num_pages as usize) * PAGE_SIZE;
+        assert_eq!(data.len(), expected_size);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let request =
+            DiskRequest::write_sequential(start_page_id, num_pages, data.as_ptr() as *mut u8)
+                .with_callback(tx);
+
+        self.schedule(request)?;
+
+        rx.recv().map_err(|e| {
+            CrioError::DiskScheduler(format!("Failed to receive completion: {}", e))
+        })?;
+
+        Ok(())
+    }
+
     /// The background worker thread function.
     /// Processes requests from the queue until shutdown is signaled.
     fn start_worker_thread(
@@ -163,16 +242,32 @@ impl DiskScheduler {
         }
     }
 
-    /// Processes a single disk request.
+    /// Processes a single disk request (supports both single-page and sequential I/O).
     fn process_request(disk_manager: &DiskManager, request: DiskRequest) {
-        let success = if request.is_write {
-            // Safety: Caller ensures data pointer is valid for PAGE_SIZE bytes
-            let data = unsafe { std::slice::from_raw_parts(request.data, PAGE_SIZE) };
-            disk_manager.write_page(request.page_id, data).is_ok()
+        let total_size = (request.num_pages as usize) * PAGE_SIZE;
+
+        let success = if request.num_pages == 1 {
+            // Single page I/O (original behavior)
+            if request.is_write {
+                let data = unsafe { std::slice::from_raw_parts(request.data, PAGE_SIZE) };
+                disk_manager.write_page(request.page_id, data).is_ok()
+            } else {
+                let data = unsafe { std::slice::from_raw_parts_mut(request.data, PAGE_SIZE) };
+                disk_manager.read_page(request.page_id, data).is_ok()
+            }
         } else {
-            // Safety: Caller ensures data pointer is valid for PAGE_SIZE bytes
-            let data = unsafe { std::slice::from_raw_parts_mut(request.data, PAGE_SIZE) };
-            disk_manager.read_page(request.page_id, data).is_ok()
+            // Sequential multi-page I/O
+            if request.is_write {
+                let data = unsafe { std::slice::from_raw_parts(request.data, total_size) };
+                disk_manager
+                    .write_pages(request.page_id, request.num_pages, data)
+                    .is_ok()
+            } else {
+                let data = unsafe { std::slice::from_raw_parts_mut(request.data, total_size) };
+                disk_manager
+                    .read_pages(request.page_id, request.num_pages, data)
+                    .is_ok()
+            }
         };
 
         // Signal completion

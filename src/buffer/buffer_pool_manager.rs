@@ -249,6 +249,97 @@ impl BufferPoolManager {
         self.state.free_list.lock().len()
     }
 
+    /// Prefetches multiple contiguous pages into the buffer pool using sequential I/O.
+    /// This reads all pages in a SINGLE disk operation, then distributes them to frames.
+    ///
+    /// This is much faster than fetching pages one-by-one because:
+    /// - ONE seek + ONE large read vs N seeks + N small reads
+    /// - Ideal for table scans where pages are accessed sequentially
+    ///
+    /// Returns the number of pages successfully prefetched.
+    /// Pages already in the buffer pool are skipped (not re-read).
+    /// If there aren't enough free frames, prefetches as many as possible.
+    pub fn prefetch_pages(&self, start_page_id: PageId, num_pages: u32) -> Result<u32> {
+        if num_pages == 0 {
+            return Ok(0);
+        }
+
+        // First, figure out which pages need to be fetched (not already in buffer pool)
+        let mut pages_to_fetch: Vec<PageId> = Vec::new();
+        {
+            let page_table = self.state.page_table.lock();
+            for i in 0..num_pages {
+                let page_id = PageId::new(start_page_id.as_u32() + i);
+                if !page_table.contains_key(&page_id) {
+                    pages_to_fetch.push(page_id);
+                }
+            }
+        }
+
+        if pages_to_fetch.is_empty() {
+            return Ok(0); // All pages already in buffer pool
+        }
+
+        // Get free frames for the pages we need to fetch
+        let mut frame_ids: Vec<FrameId> = Vec::new();
+        for _ in 0..pages_to_fetch.len() {
+            match self.get_free_frame() {
+                Ok(frame_id) => frame_ids.push(frame_id),
+                Err(_) => break, // No more free frames available
+            }
+        }
+
+        if frame_ids.is_empty() {
+            return Ok(0); // No frames available
+        }
+
+        // Limit pages to fetch based on available frames
+        let pages_to_fetch: Vec<PageId> =
+            pages_to_fetch.into_iter().take(frame_ids.len()).collect();
+        let actual_count = pages_to_fetch.len() as u32;
+
+        // Find contiguous ranges and read them sequentially
+        // For simplicity, we'll read the entire range from first to last page needed
+        let first_page = pages_to_fetch.first().unwrap().as_u32();
+        let last_page = pages_to_fetch.last().unwrap().as_u32();
+        let range_size = (last_page - first_page + 1) as usize;
+
+        // Read all pages in the range with ONE I/O operation
+        let mut bulk_data = vec![0u8; range_size * PAGE_SIZE];
+        self.disk_scheduler.schedule_read_pages_sync(
+            PageId::new(first_page),
+            range_size as u32,
+            &mut bulk_data,
+        )?;
+
+        // Distribute pages to frames
+        let mut page_table = self.state.page_table.lock();
+        for (i, page_id) in pages_to_fetch.iter().enumerate() {
+            let frame_id = frame_ids[i];
+            let frame = &self.state.frames[frame_id.as_usize()];
+
+            // Calculate offset within bulk_data for this page
+            let page_offset = (page_id.as_u32() - first_page) as usize;
+            let data_start = page_offset * PAGE_SIZE;
+            let data_end = data_start + PAGE_SIZE;
+
+            // Copy page data to frame
+            frame.set_page_id(*page_id);
+            frame.copy_from(&bulk_data[data_start..data_end]);
+            frame.set_dirty(false);
+            // Don't pin - prefetched pages are evictable until explicitly accessed
+
+            // Update page table
+            page_table.insert(*page_id, frame_id);
+
+            // Record access and mark as evictable
+            self.state.replacer.record_access(frame_id);
+            self.state.replacer.set_evictable(frame_id, true);
+        }
+
+        Ok(actual_count)
+    }
+
     /// Fetches a page into the buffer pool and returns its frame ID.
     /// If the page is already in the pool, returns its current frame.
     /// Otherwise, evicts a page if necessary and reads the page from disk.
@@ -457,5 +548,61 @@ mod tests {
 
         // Try to create a third page - should fail
         assert!(matches!(bpm.new_page(), Err(CrioError::BufferPoolFull)));
+    }
+
+    #[test]
+    fn test_buffer_pool_manager_prefetch() {
+        let (bpm, _temp) = create_bpm(10);
+
+        // Create 5 pages with data
+        for i in 0..5u8 {
+            let page_id = bpm.new_page().unwrap();
+            let mut guard = bpm.checked_write_page(page_id).unwrap().unwrap();
+            guard.data_mut()[0] = i + 1; // Write 1, 2, 3, 4, 5
+        }
+
+        // Flush all pages to disk
+        bpm.flush_all_pages().unwrap();
+
+        // Create a new BPM to start fresh (empty buffer pool)
+        drop(bpm);
+        let dm = Arc::new(DiskManager::new(_temp.path()).unwrap());
+        let bpm2 = BufferPoolManager::new(10, 2, dm);
+
+        // Buffer pool should be empty
+        assert_eq!(bpm2.free_frame_count(), 10);
+
+        // Prefetch all 5 pages in ONE operation
+        let prefetched = bpm2.prefetch_pages(PageId::new(0), 5).unwrap();
+        assert_eq!(prefetched, 5);
+
+        // Now 5 frames should be used
+        assert_eq!(bpm2.free_frame_count(), 5);
+
+        // All pages should be accessible without additional disk reads
+        for i in 0..5u8 {
+            let guard = bpm2
+                .checked_read_page(PageId::new(i as u32))
+                .unwrap()
+                .unwrap();
+            assert_eq!(guard.data()[0], i + 1);
+        }
+    }
+
+    #[test]
+    fn test_prefetch_skips_cached_pages() {
+        let (bpm, _temp) = create_bpm(10);
+
+        // Create 3 pages
+        for _ in 0..3 {
+            bpm.new_page().unwrap();
+        }
+
+        // Page 1 is already in buffer pool (from new_page)
+        // Prefetch pages 0-2 should only fetch pages not already cached
+        let prefetched = bpm.prefetch_pages(PageId::new(0), 3).unwrap();
+
+        // All 3 pages were already in buffer pool from new_page()
+        assert_eq!(prefetched, 0);
     }
 }
