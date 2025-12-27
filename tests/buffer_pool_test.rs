@@ -20,9 +20,9 @@ fn create_bpm(pool_size: usize) -> (BufferPoolManager, NamedTempFile) {
 fn test_buffer_pool_basic_operations() {
     let (bpm, _temp) = create_bpm(10);
 
-    // Create a new page
+    // Create a new page (page 0 is directory, so first data page is 1)
     let page_id = bpm.new_page().unwrap();
-    assert_eq!(page_id, PageId::new(0));
+    assert_eq!(page_id, PageId::new(1));
 
     // Write data to the page
     {
@@ -98,14 +98,13 @@ fn test_buffer_pool_eviction() {
 
     // Creating a new page should evict one
     let new_pid = bpm.new_page().unwrap();
-    assert_eq!(new_pid, PageId::new(3));
+    assert_eq!(new_pid, PageId::new(4)); // Pages 1,2,3 exist, new is 4
 
     // The evicted page's data should still be on disk
     // Access all original pages - one will be fetched from disk
-    for &pid in &page_ids {
+    for (i, &pid) in page_ids.iter().enumerate() {
         let guard = bpm.checked_read_page(pid).unwrap().unwrap();
-        let expected = pid.as_u32() as u8;
-        assert_eq!(guard.data()[0], expected);
+        assert_eq!(guard.data()[0], i as u8);
     }
 }
 

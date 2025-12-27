@@ -5,27 +5,30 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use parking_lot::Mutex;
 
-use crate::common::{PageId, Result, PAGE_SIZE};
+use crate::common::{CrioError, PageId, Result, PAGE_SIZE};
+use crate::storage::page::{DirectoryPage, DirectoryPageRef};
+
+use super::extent_allocator::ExtentAllocator;
+
+pub const DIRECTORY_PAGE_ID: PageId = PageId::new_const(0);
 
 /// DiskManager is responsible for reading and writing pages to/from disk.
 /// It manages a single database file and tracks the number of pages allocated.
 /// Supports both single-page and sequential multi-page I/O for performance.
+/// Uses extent-based allocation to keep pages for the same table contiguous.
 pub struct DiskManager {
-    /// The database file
     db_file: Mutex<File>,
-    /// Path to the database file
     db_path: String,
-    /// Number of pages currently allocated
     num_pages: AtomicU32,
-    /// Number of disk reads performed (counts each I/O operation, not pages)
     num_reads: AtomicU32,
-    /// Number of disk writes performed (counts each I/O operation, not pages)
     num_writes: AtomicU32,
+    extent_allocator: ExtentAllocator,
 }
 
 impl DiskManager {
     /// Creates a new DiskManager for the given database file path.
-    /// Creates the file if it doesn't exist.
+    /// If the file doesn't exist, creates it and initializes the directory page.
+    /// If the file exists, validates the directory page.
     pub fn new<P: AsRef<Path>>(db_path: P) -> Result<Self> {
         let path_str = db_path.as_ref().to_string_lossy().to_string();
 
@@ -40,13 +43,71 @@ impl DiskManager {
         let file_size = metadata.len();
         let num_pages = (file_size / PAGE_SIZE as u64) as u32;
 
-        Ok(Self {
+        let extent_allocator = if num_pages > 0 {
+            ExtentAllocator::from_existing(num_pages)
+        } else {
+            ExtentAllocator::new()
+        };
+
+        let dm = Self {
             db_file: Mutex::new(file),
             db_path: path_str,
             num_pages: AtomicU32::new(num_pages),
             num_reads: AtomicU32::new(0),
             num_writes: AtomicU32::new(0),
-        })
+            extent_allocator,
+        };
+
+        if num_pages == 0 {
+            dm.init_directory_page()?;
+        } else {
+            dm.validate_directory_page()?;
+        }
+
+        Ok(dm)
+    }
+
+    fn init_directory_page(&self) -> Result<()> {
+        let mut data = [0u8; PAGE_SIZE];
+        {
+            let mut dir_page = DirectoryPage::new(&mut data);
+            dir_page.init();
+        }
+
+        self.num_pages.store(1, Ordering::SeqCst);
+
+        let mut file = self.db_file.lock();
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&data)?;
+        file.flush()?;
+
+        self.num_writes.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn validate_directory_page(&self) -> Result<()> {
+        let mut data = [0u8; PAGE_SIZE];
+
+        {
+            let mut file = self.db_file.lock();
+            file.seek(SeekFrom::Start(0))?;
+            file.read_exact(&mut data)?;
+        }
+
+        let dir_page = DirectoryPageRef::new(&data);
+        if !dir_page.is_valid() {
+            return Err(CrioError::InvalidDatabaseFile);
+        }
+
+        Ok(())
+    }
+
+    pub fn read_directory_page(&self, data: &mut [u8]) -> Result<()> {
+        self.read_page(DIRECTORY_PAGE_ID, data)
+    }
+
+    pub fn write_directory_page(&self, data: &[u8]) -> Result<()> {
+        self.write_page(DIRECTORY_PAGE_ID, data)
     }
 
     /// Reads a page from disk into the provided buffer.
@@ -152,22 +213,65 @@ impl DiskManager {
 
     /// Allocates a new page on disk and returns its page ID.
     /// The page is zero-initialized.
+    /// Note: For better sequential access, use allocate_page_for_table() instead.
     pub fn allocate_page(&self) -> Result<PageId> {
         let page_id = PageId::new(self.num_pages.fetch_add(1, Ordering::SeqCst));
 
-        // Zero-initialize the new page
         let zeros = [0u8; PAGE_SIZE];
         self.write_page(page_id, &zeros)?;
 
         Ok(page_id)
     }
 
-    /// Deallocates a page. In this simple implementation, we don't actually
-    /// reclaim the space - we just note that the page is no longer in use.
-    /// A more sophisticated implementation would maintain a free list.
-    pub fn deallocate_page(&self, _page_id: PageId) -> Result<()> {
-        // In a real implementation, we would add this page to a free list
-        // For now, we just leave it allocated but unused
+    /// Allocates a new page for a specific table, keeping pages contiguous.
+    /// Pages for the same table are allocated within the same extent when possible.
+    /// This maximizes sequential access during table scans.
+    pub fn allocate_page_for_table(&self, table_id: u32) -> Result<PageId> {
+        let page_id = self.extent_allocator.allocate_page_for_table(table_id)?;
+
+        let required_pages = (page_id.as_u32() + 1) as u32;
+        let current_pages = self.num_pages.load(Ordering::Relaxed);
+        if required_pages > current_pages {
+            self.num_pages.store(required_pages, Ordering::SeqCst);
+        }
+
+        let zeros = [0u8; PAGE_SIZE];
+        self.write_page(page_id, &zeros)?;
+
+        Ok(page_id)
+    }
+
+    /// Allocates a full extent (8 contiguous pages) for a table.
+    /// Returns all page IDs in the extent. Ideal for bulk table creation.
+    pub fn allocate_extent_for_table(&self, table_id: u32) -> Result<Vec<PageId>> {
+        let pages = self.extent_allocator.allocate_extent_for_table(table_id)?;
+
+        if let Some(last_page) = pages.last() {
+            let required_pages = last_page.as_u32() + 1;
+            let current_pages = self.num_pages.load(Ordering::Relaxed);
+            if required_pages > current_pages {
+                self.num_pages.store(required_pages, Ordering::SeqCst);
+            }
+        }
+
+        let zeros = vec![0u8; PAGE_SIZE * pages.len()];
+        if let Some(first_page) = pages.first() {
+            self.write_pages(*first_page, pages.len() as u32, &zeros)?;
+        }
+
+        Ok(pages)
+    }
+
+    /// Returns contiguous page ranges for a table.
+    /// Each tuple is (start_page_id, num_pages) representing a contiguous range.
+    /// Use this information to perform sequential reads during table scans.
+    pub fn get_table_page_ranges(&self, table_id: u32) -> Vec<(PageId, u32)> {
+        self.extent_allocator.get_contiguous_pages(table_id)
+    }
+
+    /// Deallocates a page.
+    pub fn deallocate_page(&self, page_id: PageId) -> Result<()> {
+        self.extent_allocator.deallocate_page(page_id);
         Ok(())
     }
 
@@ -216,7 +320,7 @@ mod tests {
     fn test_disk_manager_new() {
         let temp_file = NamedTempFile::new().unwrap();
         let dm = DiskManager::new(temp_file.path()).unwrap();
-        assert_eq!(dm.get_num_pages(), 0);
+        assert_eq!(dm.get_num_pages(), 1); // Directory page at page 0
     }
 
     #[test]
@@ -225,12 +329,12 @@ mod tests {
         let dm = DiskManager::new(temp_file.path()).unwrap();
 
         let page_id = dm.allocate_page().unwrap();
-        assert_eq!(page_id, PageId::new(0));
-        assert_eq!(dm.get_num_pages(), 1);
+        assert_eq!(page_id, PageId::new(1)); // Page 0 is directory
+        assert_eq!(dm.get_num_pages(), 2);
 
         let page_id2 = dm.allocate_page().unwrap();
-        assert_eq!(page_id2, PageId::new(1));
-        assert_eq!(dm.get_num_pages(), 2);
+        assert_eq!(page_id2, PageId::new(2));
+        assert_eq!(dm.get_num_pages(), 3);
     }
 
     #[test]
@@ -261,7 +365,6 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path().to_path_buf();
 
-        // Write data
         {
             let dm = DiskManager::new(&path).unwrap();
             let page_id = dm.allocate_page().unwrap();
@@ -270,13 +373,12 @@ mod tests {
             dm.write_page(page_id, &data).unwrap();
         }
 
-        // Read it back with a new DiskManager
         {
             let dm = DiskManager::new(&path).unwrap();
-            assert_eq!(dm.get_num_pages(), 1);
+            assert_eq!(dm.get_num_pages(), 2); // Directory + 1 data page
 
             let mut data = [0u8; PAGE_SIZE];
-            dm.read_page(PageId::new(0), &mut data).unwrap();
+            dm.read_page(PageId::new(1), &mut data).unwrap();
             assert_eq!(data[0], 123);
         }
     }

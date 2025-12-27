@@ -12,9 +12,9 @@ fn test_disk_manager_create_file() {
     let temp_file = NamedTempFile::new().unwrap();
     let dm = DiskManager::new(temp_file.path()).unwrap();
 
-    assert_eq!(dm.get_num_pages(), 0);
+    assert_eq!(dm.get_num_pages(), 1); // Directory page at 0
     assert_eq!(dm.get_num_reads(), 0);
-    assert_eq!(dm.get_num_writes(), 0);
+    assert_eq!(dm.get_num_writes(), 1); // Directory page write
 }
 
 #[test]
@@ -24,10 +24,10 @@ fn test_disk_manager_allocate_pages() {
 
     for i in 0..10 {
         let page_id = dm.allocate_page().unwrap();
-        assert_eq!(page_id, PageId::new(i));
+        assert_eq!(page_id, PageId::new(i + 1)); // Page 0 is directory
     }
 
-    assert_eq!(dm.get_num_pages(), 10);
+    assert_eq!(dm.get_num_pages(), 11); // 1 directory + 10 data pages
 }
 
 #[test]
@@ -96,10 +96,10 @@ fn test_disk_manager_persistence() {
     // Read back with a new DiskManager
     {
         let dm = DiskManager::new(&path).unwrap();
-        assert_eq!(dm.get_num_pages(), 1);
+        assert_eq!(dm.get_num_pages(), 2); // 1 directory + 1 data page
 
         let mut data = [0u8; PAGE_SIZE];
-        dm.read_page(PageId::new(0), &mut data).unwrap();
+        dm.read_page(PageId::new(1), &mut data).unwrap(); // Data page is at 1
         assert_eq!(&data[..test_data.len()], test_data);
     }
 }
@@ -194,14 +194,14 @@ fn test_disk_manager_io_stats() {
     let dm = DiskManager::new(temp_file.path()).unwrap();
 
     assert_eq!(dm.get_num_reads(), 0);
-    assert_eq!(dm.get_num_writes(), 0);
+    assert_eq!(dm.get_num_writes(), 1); // Directory page write on init
 
     let page_id = dm.allocate_page().unwrap();
-    assert_eq!(dm.get_num_writes(), 1); // allocate_page writes zeros
+    assert_eq!(dm.get_num_writes(), 2); // allocate_page writes zeros
 
     let data = [0u8; PAGE_SIZE];
     dm.write_page(page_id, &data).unwrap();
-    assert_eq!(dm.get_num_writes(), 2);
+    assert_eq!(dm.get_num_writes(), 3);
 
     let mut read_data = [0u8; PAGE_SIZE];
     dm.read_page(page_id, &mut read_data).unwrap();

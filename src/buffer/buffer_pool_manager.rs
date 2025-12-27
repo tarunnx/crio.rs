@@ -1,4 +1,4 @@
-use std::collections::{HashMap, LinkedList};
+use std::collections::{HashMap, LinkedList, VecDeque};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -8,16 +8,48 @@ use crate::storage::disk::{DiskManager, DiskScheduler};
 
 use super::{FrameHeader, LruKReplacer, ReadPageGuard, WritePageGuard};
 
-/// Internal state that can be shared across threads
+const PREFETCH_LOOKAHEAD: u32 = 4;
+const SEQUENTIAL_THRESHOLD: usize = 3;
+
+struct AccessTracker {
+    recent_accesses: VecDeque<PageId>,
+}
+
+impl AccessTracker {
+    fn new() -> Self {
+        Self {
+            recent_accesses: VecDeque::with_capacity(SEQUENTIAL_THRESHOLD + 1),
+        }
+    }
+
+    fn record(&mut self, page_id: PageId) {
+        if self.recent_accesses.len() >= SEQUENTIAL_THRESHOLD + 1 {
+            self.recent_accesses.pop_front();
+        }
+        self.recent_accesses.push_back(page_id);
+    }
+
+    fn is_sequential(&self) -> bool {
+        if self.recent_accesses.len() < SEQUENTIAL_THRESHOLD {
+            return false;
+        }
+
+        let accesses: Vec<_> = self.recent_accesses.iter().collect();
+        for i in 1..accesses.len() {
+            if accesses[i].as_u32() != accesses[i - 1].as_u32() + 1 {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 struct BufferPoolState {
-    /// The buffer pool frames
     frames: Vec<Arc<FrameHeader>>,
-    /// Page table: maps page IDs to frame IDs
     page_table: Mutex<HashMap<PageId, FrameId>>,
-    /// Free list: frames that are not currently in use
     free_list: Mutex<LinkedList<FrameId>>,
-    /// LRU-K replacer for eviction decisions
     replacer: LruKReplacer,
+    access_tracker: Mutex<AccessTracker>,
 }
 
 /// BufferPoolManager is responsible for fetching database pages from disk
@@ -50,6 +82,7 @@ impl BufferPoolManager {
             page_table: Mutex::new(HashMap::new()),
             free_list: Mutex::new(free_list),
             replacer: LruKReplacer::new(k, pool_size),
+            access_tracker: Mutex::new(AccessTracker::new()),
         });
 
         Self {
@@ -211,20 +244,61 @@ impl BufferPoolManager {
         }
     }
 
-    /// Flushes all pages in the buffer pool to disk.
+    /// Flushes all dirty pages to disk using sequential I/O when possible.
+    /// Groups contiguous dirty pages and writes them in single I/O operations.
     pub fn flush_all_pages(&self) -> Result<()> {
         let page_table = self.state.page_table.lock();
 
-        for (&page_id, &frame_id) in page_table.iter() {
-            let frame = &self.state.frames[frame_id.as_usize()];
+        let mut dirty_pages: Vec<(PageId, FrameId)> = page_table
+            .iter()
+            .filter(|(_, &frame_id)| self.state.frames[frame_id.as_usize()].is_dirty())
+            .map(|(&pid, &fid)| (pid, fid))
+            .collect();
 
-            if frame.is_dirty() {
+        if dirty_pages.is_empty() {
+            return Ok(());
+        }
+
+        dirty_pages.sort_by_key(|(pid, _)| pid.as_u32());
+
+        let mut i = 0;
+        while i < dirty_pages.len() {
+            let start_idx = i;
+            let start_page = dirty_pages[start_idx].0;
+
+            while i + 1 < dirty_pages.len()
+                && dirty_pages[i + 1].0.as_u32() == dirty_pages[i].0.as_u32() + 1
+            {
+                i += 1;
+            }
+
+            let count = i - start_idx + 1;
+
+            if count == 1 {
+                let frame = &self.state.frames[dirty_pages[start_idx].1.as_usize()];
                 let mut data = [0u8; PAGE_SIZE];
                 frame.copy_to(&mut data);
-
-                self.disk_scheduler.schedule_write_sync(page_id, &data)?;
+                self.disk_scheduler.schedule_write_sync(start_page, &data)?;
                 frame.set_dirty(false);
+            } else {
+                let mut bulk_data = vec![0u8; count * PAGE_SIZE];
+                for j in 0..count {
+                    let frame = &self.state.frames[dirty_pages[start_idx + j].1.as_usize()];
+                    let offset = j * PAGE_SIZE;
+                    frame.copy_to(&mut bulk_data[offset..offset + PAGE_SIZE]);
+                }
+                self.disk_scheduler.schedule_write_pages_sync(
+                    start_page,
+                    count as u32,
+                    &bulk_data,
+                )?;
+                for j in 0..count {
+                    let frame = &self.state.frames[dirty_pages[start_idx + j].1.as_usize()];
+                    frame.set_dirty(false);
+                }
             }
+
+            i += 1;
         }
 
         Ok(())
@@ -343,8 +417,8 @@ impl BufferPoolManager {
     /// Fetches a page into the buffer pool and returns its frame ID.
     /// If the page is already in the pool, returns its current frame.
     /// Otherwise, evicts a page if necessary and reads the page from disk.
+    /// Automatically prefetches ahead if sequential access pattern is detected.
     fn fetch_page(&self, page_id: PageId) -> Result<FrameId> {
-        // Check if page is already in the buffer pool
         {
             let page_table = self.state.page_table.lock();
             if let Some(&frame_id) = page_table.get(&page_id) {
@@ -356,28 +430,38 @@ impl BufferPoolManager {
             }
         }
 
-        // Need to fetch from disk - get a free frame first
         let frame_id = self.get_free_frame()?;
         let frame = &self.state.frames[frame_id.as_usize()];
 
-        // Read the page from disk
         let mut data = [0u8; PAGE_SIZE];
         self.disk_scheduler.schedule_read_sync(page_id, &mut data)?;
 
-        // Initialize the frame
         frame.set_page_id(page_id);
         frame.copy_from(&data);
         frame.set_dirty(false);
         frame.pin();
 
-        // Update page table
         self.state.page_table.lock().insert(page_id, frame_id);
 
-        // Record access and mark as not evictable
         self.state.replacer.record_access(frame_id);
         self.state.replacer.set_evictable(frame_id, false);
 
+        self.maybe_prefetch(page_id);
+
         Ok(frame_id)
+    }
+
+    fn maybe_prefetch(&self, page_id: PageId) {
+        let should_prefetch = {
+            let mut tracker = self.state.access_tracker.lock();
+            tracker.record(page_id);
+            tracker.is_sequential()
+        };
+
+        if should_prefetch {
+            let next_page = PageId::new(page_id.as_u32() + 1);
+            let _ = self.prefetch_pages(next_page, PREFETCH_LOOKAHEAD);
+        }
     }
 
     /// Gets a free frame, either from the free list or by evicting a page.
@@ -440,8 +524,8 @@ mod tests {
         let (bpm, _temp) = create_bpm(10);
 
         let page_id = bpm.new_page().unwrap();
-        assert_eq!(page_id, PageId::new(0));
-        assert_eq!(bpm.get_pin_count(page_id), Some(0)); // Not pinned until guard is acquired
+        assert_eq!(page_id, PageId::new(1)); // Page 0 is directory
+        assert_eq!(bpm.get_pin_count(page_id), Some(0));
         assert_eq!(bpm.free_frame_count(), 9);
     }
 
@@ -514,7 +598,7 @@ mod tests {
 
         // Create a new page - should evict one of the existing pages
         let new_page_id = bpm.new_page().unwrap();
-        assert_eq!(new_page_id, PageId::new(3));
+        assert_eq!(new_page_id, PageId::new(4)); // 1,2,3 + new = 4
     }
 
     #[test]
@@ -554,35 +638,30 @@ mod tests {
     fn test_buffer_pool_manager_prefetch() {
         let (bpm, _temp) = create_bpm(10);
 
-        // Create 5 pages with data
-        for i in 0..5u8 {
+        // Create 4 pages with data (pages 1-4, since 0 is directory)
+        for i in 0..4u8 {
             let page_id = bpm.new_page().unwrap();
             let mut guard = bpm.checked_write_page(page_id).unwrap().unwrap();
-            guard.data_mut()[0] = i + 1; // Write 1, 2, 3, 4, 5
+            guard.data_mut()[0] = i + 1;
         }
 
-        // Flush all pages to disk
         bpm.flush_all_pages().unwrap();
 
-        // Create a new BPM to start fresh (empty buffer pool)
         drop(bpm);
         let dm = Arc::new(DiskManager::new(_temp.path()).unwrap());
         let bpm2 = BufferPoolManager::new(10, 2, dm);
 
-        // Buffer pool should be empty
         assert_eq!(bpm2.free_frame_count(), 10);
 
-        // Prefetch all 5 pages in ONE operation
-        let prefetched = bpm2.prefetch_pages(PageId::new(0), 5).unwrap();
-        assert_eq!(prefetched, 5);
+        // Prefetch pages 1-4 (page 0 is directory)
+        let prefetched = bpm2.prefetch_pages(PageId::new(1), 4).unwrap();
+        assert_eq!(prefetched, 4);
 
-        // Now 5 frames should be used
-        assert_eq!(bpm2.free_frame_count(), 5);
+        assert_eq!(bpm2.free_frame_count(), 6);
 
-        // All pages should be accessible without additional disk reads
-        for i in 0..5u8 {
+        for i in 0..4u8 {
             let guard = bpm2
-                .checked_read_page(PageId::new(i as u32))
+                .checked_read_page(PageId::new(i as u32 + 1))
                 .unwrap()
                 .unwrap();
             assert_eq!(guard.data()[0], i + 1);
@@ -593,16 +672,14 @@ mod tests {
     fn test_prefetch_skips_cached_pages() {
         let (bpm, _temp) = create_bpm(10);
 
-        // Create 3 pages
+        // Create 3 pages (pages 1, 2, 3)
         for _ in 0..3 {
             bpm.new_page().unwrap();
         }
 
-        // Page 1 is already in buffer pool (from new_page)
-        // Prefetch pages 0-2 should only fetch pages not already cached
-        let prefetched = bpm.prefetch_pages(PageId::new(0), 3).unwrap();
+        // Prefetch pages 1-3 should skip since they're already cached
+        let prefetched = bpm.prefetch_pages(PageId::new(1), 3).unwrap();
 
-        // All 3 pages were already in buffer pool from new_page()
         assert_eq!(prefetched, 0);
     }
 }

@@ -9,6 +9,10 @@ impl PageId {
         Self(id)
     }
 
+    pub const fn new_const(id: u32) -> Self {
+        Self(id)
+    }
+
     pub fn as_u32(&self) -> u32 {
         self.0
     }

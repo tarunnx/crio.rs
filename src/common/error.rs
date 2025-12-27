@@ -49,6 +49,18 @@ pub enum CrioError {
 
     #[error("Channel error: {0}")]
     Channel(String),
+
+    #[error("Table {0} already exists")]
+    TableAlreadyExists(u32),
+
+    #[error("Table {0} not found")]
+    TableNotFound(u32),
+
+    #[error("Directory page is full")]
+    DirectoryFull,
+
+    #[error("Invalid database file")]
+    InvalidDatabaseFile,
 }
 
 pub type Result<T> = std::result::Result<T, CrioError>;
