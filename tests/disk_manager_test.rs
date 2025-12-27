@@ -232,3 +232,192 @@ fn test_disk_manager_large_file() {
         assert_eq!(u32::from_le_bytes(id_bytes), pid.as_u32());
     }
 }
+
+#[test]
+fn test_page_id_encoding() {
+    assert_eq!(PageId::from_parts(0, 0).file_id(), 0);
+    assert_eq!(PageId::from_parts(0, 0).page_offset(), 0);
+
+    assert_eq!(PageId::from_parts(1, 100).file_id(), 1);
+    assert_eq!(PageId::from_parts(1, 100).page_offset(), 100);
+
+    assert_eq!(PageId::from_parts(255, 0x00FFFFFF).file_id(), 255);
+    assert_eq!(
+        PageId::from_parts(255, 0x00FFFFFF).page_offset(),
+        0x00FFFFFF
+    );
+
+    let max_page = PageId::from_parts(255, PageId::PAGE_OFFSET_MASK);
+    assert_eq!(max_page.as_u32(), 0xFFFFFFFF);
+}
+
+#[test]
+#[should_panic(expected = "Page offset too large")]
+fn test_page_id_overflow_panics() {
+    PageId::from_parts(0, PageId::PAGE_OFFSET_MASK + 1);
+}
+
+#[test]
+fn test_multi_file_isolation() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("multi.db");
+    let dm = DiskManager::new(&db_path).unwrap();
+
+    let file1_id = dm.add_file().unwrap();
+    assert_eq!(file1_id, 1);
+
+    let page_f0 = PageId::from_parts(0, 5);
+    let page_f1 = PageId::from_parts(1, 5);
+
+    let mut data_f0 = [0u8; PAGE_SIZE];
+    data_f0[0] = 111;
+    dm.write_page(page_f0, &data_f0).unwrap();
+
+    let mut data_f1 = [0u8; PAGE_SIZE];
+    data_f1[0] = 222;
+    dm.write_page(page_f1, &data_f1).unwrap();
+
+    let mut read_f0 = [0u8; PAGE_SIZE];
+    dm.read_page(page_f0, &mut read_f0).unwrap();
+    assert_eq!(read_f0[0], 111);
+
+    let mut read_f1 = [0u8; PAGE_SIZE];
+    dm.read_page(page_f1, &mut read_f1).unwrap();
+    assert_eq!(read_f1[0], 222);
+}
+
+#[test]
+fn test_multi_file_persistence() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("persist_multi.db");
+
+    {
+        let dm = DiskManager::new(&db_path).unwrap();
+        dm.add_file().unwrap();
+        dm.add_file().unwrap();
+
+        let page0 = PageId::from_parts(0, 2);
+        let page1 = PageId::from_parts(1, 0);
+        let page2 = PageId::from_parts(2, 0);
+
+        let mut data = [0u8; PAGE_SIZE];
+        data[0] = 10;
+        dm.write_page(page0, &data).unwrap();
+
+        data[0] = 20;
+        dm.write_page(page1, &data).unwrap();
+
+        data[0] = 30;
+        dm.write_page(page2, &data).unwrap();
+
+        dm.sync().unwrap();
+    }
+
+    {
+        let dm = DiskManager::new(&db_path).unwrap();
+
+        let mut data = [0u8; PAGE_SIZE];
+
+        dm.read_page(PageId::from_parts(0, 2), &mut data).unwrap();
+        assert_eq!(data[0], 10);
+
+        dm.read_page(PageId::from_parts(1, 0), &mut data).unwrap();
+        assert_eq!(data[0], 20);
+
+        dm.read_page(PageId::from_parts(2, 0), &mut data).unwrap();
+        assert_eq!(data[0], 30);
+    }
+}
+
+#[test]
+fn test_sequential_io_within_file() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("seq.db");
+    let dm = DiskManager::new(&db_path).unwrap();
+
+    let start_page = PageId::from_parts(0, 10);
+    let num_pages = 5;
+
+    let mut write_data = vec![0u8; PAGE_SIZE * num_pages];
+    for i in 0..num_pages {
+        write_data[i * PAGE_SIZE] = (i + 100) as u8;
+    }
+
+    dm.write_pages(start_page, num_pages as u32, &write_data)
+        .unwrap();
+
+    let mut read_data = vec![0u8; PAGE_SIZE * num_pages];
+    dm.read_pages(start_page, num_pages as u32, &mut read_data)
+        .unwrap();
+
+    for i in 0..num_pages {
+        assert_eq!(read_data[i * PAGE_SIZE], (i + 100) as u8);
+    }
+}
+
+#[test]
+fn test_sequential_io_boundary_check() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("boundary.db");
+    let dm = DiskManager::new(&db_path).unwrap();
+
+    let near_limit = PageId::PAGE_OFFSET_MASK - 10;
+    let start_page = PageId::from_parts(0, near_limit);
+
+    let too_many_pages = 20;
+    let data = vec![0u8; PAGE_SIZE * too_many_pages];
+
+    let result = dm.write_pages(start_page, too_many_pages as u32, &data);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("file boundary"));
+}
+
+#[test]
+fn test_read_from_nonexistent_file() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("nofile.db");
+    let dm = DiskManager::new(&db_path).unwrap();
+
+    let page_in_file5 = PageId::from_parts(5, 0);
+    let mut data = [0u8; PAGE_SIZE];
+
+    let result = dm.read_page(page_in_file5, &mut data);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_concurrent_multi_file_access() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("concurrent.db");
+    let dm = Arc::new(DiskManager::new(&db_path).unwrap());
+
+    dm.add_file().unwrap();
+    dm.add_file().unwrap();
+
+    let handles: Vec<_> = (0..3)
+        .map(|file_id| {
+            let dm_clone = Arc::clone(&dm);
+            thread::spawn(move || {
+                for i in 0..10 {
+                    let page_id = PageId::from_parts(file_id as u8, i);
+                    let mut data = [0u8; PAGE_SIZE];
+                    data[0] = (file_id * 100 + i) as u8;
+                    dm_clone.write_page(page_id, &data).unwrap();
+                }
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    for file_id in 0..3 {
+        for i in 0..10 {
+            let page_id = PageId::from_parts(file_id as u8, i);
+            let mut data = [0u8; PAGE_SIZE];
+            dm.read_page(page_id, &mut data).unwrap();
+            assert_eq!(data[0], (file_id * 100 + i) as u8);
+        }
+    }
+}

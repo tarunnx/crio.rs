@@ -1,11 +1,29 @@
 use std::fmt;
 
-/// Page identifier type - uniquely identifies a page on disk
+/// Page identifier type - uniquely identifies a page on disk.
+/// Uses bit-packing to support multi-file addressing:
+/// - High 8 bits: File ID (up to 256 files)
+/// - Low 24 bits: Page Offset (up to 16M pages per file)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PageId(pub u32);
 
 impl PageId {
+    /// Mask for extracting the Page Offset (lower 24 bits)
+    pub const PAGE_OFFSET_MASK: u32 = 0x00FF_FFFF;
+    /// Mask for extracting the File ID (upper 8 bits)
+    pub const FILE_ID_MASK: u32 = 0xFF00_0000;
+    /// Number of bits to shift for File ID
+    pub const FILE_ID_SHIFT: u32 = 24;
+
     pub fn new(id: u32) -> Self {
+        Self(id)
+    }
+
+    /// Creates a PageId from a specific File ID and Page Offset
+    pub fn from_parts(file_id: u8, page_offset: u32) -> Self {
+        // Ensure page_offset fits in 24 bits
+        assert!(page_offset <= Self::PAGE_OFFSET_MASK, "Page offset too large");
+        let id = ((file_id as u32) << Self::FILE_ID_SHIFT) | (page_offset & Self::PAGE_OFFSET_MASK);
         Self(id)
     }
 
@@ -16,11 +34,21 @@ impl PageId {
     pub fn as_u32(&self) -> u32 {
         self.0
     }
+
+    /// Returns the File ID component of this PageId
+    pub fn file_id(&self) -> u8 {
+        ((self.0 & Self::FILE_ID_MASK) >> Self::FILE_ID_SHIFT) as u8
+    }
+
+    /// Returns the Page Offset component of this PageId
+    pub fn page_offset(&self) -> u32 {
+        self.0 & Self::PAGE_OFFSET_MASK
+    }
 }
 
 impl fmt::Display for PageId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "PageId({})", self.0)
+        write!(f, "PageId({}:{})", self.file_id(), self.page_offset())
     }
 }
 

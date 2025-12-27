@@ -1,6 +1,6 @@
-## Database internals
+## Crio
 
-The implementation details of a relational database management system.
+Crio is a relational database management system that provides a simple and efficient way to store and retrieve data. This is a brief overview of its implementation details.
 
 ### Disk Manager
 
@@ -12,6 +12,8 @@ The Buffer Pool Manager acts as a specialized virtual memory system, creating th
 
 ### Files and Pages
 
-The database persists data in a single file composed of fixed-size pages. Each page serves as the fundamental unit of I/O and storage, utilizing a slotted-page architecture to manage variable-length tuples and metadata efficiently. This structure ensures a mapping between logical record identifiers and physical disk offsets.
+The database persists data in a single file composed of fixed-size pages, currently set to **4KB**. This size corresponds to the standard page size of most operating systems and hardware (SSDs/HDDs), ensuring:
+- **Atomic I/O:** Reading or writing a single database page maps directly to a single OS memory page and typically a single hardware block, minimizing write amplification and "torn page" risks.
+- **Efficient Memory Management:** The buffer pool frames align perfectly with the OS virtual memory system.
 
-Each page header includes critical metadata such as the **Page ID** and **Log Sequence Number (LSN)**. This enables self-identification to detect file system corruption and supports robust crash recovery via the Write-Ahead Logging (WAL) protocol, ensuring data consistency by tracking which modifications have been persisted to disk.
+Each page utilizes a slotted-page architecture to manage variable-length tuples and metadata efficiently. Each page header includes critical metadata such as the **Page ID** and **Log Sequence Number (LSN)**. This enables self-identification to detect file system corruption and supports robust crash recovery via the Write-Ahead Logging (WAL) protocol, ensuring data consistency by tracking which modifications have been persisted to disk.
