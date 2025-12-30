@@ -20,11 +20,17 @@
 //!   - `FrameHeader`: Per-frame metadata and data storage
 //!   - `ReadPageGuard`/`WritePageGuard`: RAII guards for thread-safe page access
 //!
+//! - **Tuple** (`tuple`): Typed tuple representation and serialization
+//!   - `DataType`: Column type definitions (Integer, VarChar, etc.)
+//!   - `Value`: Typed values for storage and computation
+//!   - `Schema`: Table structure with column definitions
+//!   - `Tuple`: Row representation with serialization/deserialization
+//!
 //! - **Catalog** (`catalog`): System catalog and metadata management (TODO)
 //!
 //! - **Execution** (`execution`): Query execution engine (TODO)
 //!
-//! - **Index** (`index`): Index structures like B+Tree (TODO)
+//! - **Index** (`index`): B+Tree index structures
 //!
 //! # Example
 //!
@@ -62,6 +68,7 @@ pub mod common;
 pub mod execution;
 pub mod index;
 pub mod storage;
+pub mod tuple;
 
 // Re-export commonly used types at the crate root
 pub use common::{CrioError, PageId, RecordId, Result, SlotId};

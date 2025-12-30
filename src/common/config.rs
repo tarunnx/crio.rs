@@ -13,4 +13,13 @@ pub const DEFAULT_LRUK_K: usize = 2;
 /// Default buffer pool size (number of frames)
 pub const DEFAULT_BUFFER_POOL_SIZE: usize = 10;
 
+/// Default B+ tree order (max keys per node)
+pub const DEFAULT_BTREE_ORDER: usize = 128;
+
+/// Default minimum keys per node (typically order/2)
+pub const DEFAULT_BTREE_MIN_KEYS: usize = 64;
+
+/// Key prefix size for fast comparisons
+pub const KEY_PREFIX_SIZE: usize = 16;
+
 use super::types::{FrameId, PageId};

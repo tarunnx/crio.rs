@@ -61,6 +61,18 @@ pub enum CrioError {
 
     #[error("Invalid database file")]
     InvalidDatabaseFile,
+
+    #[error("Duplicate key: {0}")]
+    DuplicateKey(u32),
+
+    #[error("Key not found")]
+    KeyNotFound,
+
+    #[error("Index {0} not found")]
+    IndexNotFound(u32),
+
+    #[error("Index corrupted: {0}")]
+    IndexCorrupted(String),
 }
 
 pub type Result<T> = std::result::Result<T, CrioError>;
